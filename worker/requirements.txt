@@ -1,0 +1,7 @@
+# RavakWP build-engine worker dependencies (Python 3.10+)
+requests>=2.31
+Pillow>=10.0
+# redis is ONLY required when the worker is configured with REDIS_URL
+# (queue mode). The worker imports it lazily; REST table-queue fallback
+# (poll /internal/poll) needs no redis package at all.
+redis>=5.0

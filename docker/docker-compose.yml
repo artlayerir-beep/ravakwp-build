@@ -1,0 +1,75 @@
+# =============================================================================
+# RavakWP Build Engine — docker compose
+# -----------------------------------------------------------------------------
+# Primary local-mode flow (the WP plugin option `rvk_build_driver=local`
+# expects this daemon to run next to WordPress):
+#
+#     cd build-engine/docker
+#     cp .env.example .env         # then fill WP_SITE_URL + WP_HMAC_KEY
+#     docker compose up -d worker  # REST table-queue (no Redis needed)
+#     docker compose --profile redis up -d   # optional Redis queue mode
+#
+# Scaling: `docker compose up -d --scale worker=2` — with Redis each worker
+# BRPOPs a different job (safe). Without Redis, scale ONLY if your WP host
+# can handle concurrent signed polls; one worker per WP site is recommended.
+# =============================================================================
+
+services:
+  worker:
+    build:
+      context: ..                        # build-engine/ (Dockerfile COPYs worker/ from here)
+      dockerfile: docker/Dockerfile
+    image: ravakwp/build-engine:1.0.0
+    container_name: ravakwp-build-worker
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/opt/worker/entrypoint.sh"]  # mkdirs + umask 077
+    env_file:
+      - .env                           # WP_SITE_URL, WP_HMAC_KEY, …
+    environment:
+      # explicit pass-through (values come from .env)
+      WORKER_MODE: ${WORKER_MODE:-local}
+      WP_SITE_URL: ${WP_SITE_URL:?set WP_SITE_URL in .env}
+      WP_HMAC_KEY: ${WP_HMAC_KEY:-}
+      REDIS_URL: ${REDIS_URL:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-1}
+      RVK_STORE_KEY: ${RVK_STORE_KEY:-}
+    volumes:
+      - workspaces:/var/lib/ravakwp/workspaces    # build sandboxes (0700)
+      - templates:/var/lib/ravakwp/templates      # template zip cache
+      - gradle-cache:/var/lib/ravakwp/gradle-home # Gradle deps cache
+    # Resource limits — ONE parallel build needs ~4 GB RAM (Gradle/Kotlin
+    # daemonless + AAPT2). Concurrency × 4 GB is a sane rule of thumb.
+    mem_limit: 6g
+    cpus: 2.0
+    # Swarm-style equivalent (kept as comments — ignored by plain compose):
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "2.0"
+    #       memory: 6G
+    healthcheck:                       # same probe as the Dockerfile one
+      test: ["CMD", "python3", "-c", "import os,sys,time; p=os.environ.get('RVK_HEARTBEAT','/var/lib/ravakwp/worker-heartbeat'); p=p if os.path.exists(p) else '/tmp/rvk-worker-heartbeat'; sys.exit(0 if os.path.exists(p) and (time.time()-os.path.getmtime(p))<90 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: ravakwp-build-redis
+    profiles: ["redis"]                # opt-in: docker compose --profile redis up -d
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  workspaces:
+  templates:
+  gradle-cache:
+  redis-data:
