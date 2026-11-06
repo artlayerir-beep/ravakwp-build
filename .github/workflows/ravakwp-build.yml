@@ -1,0 +1,120 @@
+# =============================================================================
+# RavakWP App Builder — GitHub Actions Build (third engine, v1.2.0)
+# -----------------------------------------------------------------------------
+# Place this file in YOUR repository at .github/workflows/ravakwp-build.yml
+# and add three repository Secrets (Settings → Secrets and variables → Actions):
+#
+#   RVK_SITE_URL   → https://your-store.com
+#   RVK_STORE_KEY  → store key from the plugin panel
+#   RVK_HMAC_KEY   → build HMAC key from the plugin panel
+#
+# The build is dispatched from the WordPress panel (plugin sends build_id);
+# the runner downloads its own code bundle from your site (HMAC-signed),
+# runs the SAME build pipeline as the Docker worker, and delivers APK/AAB
+# back to WordPress through the same signed callbacks. No Docker needed.
+# =============================================================================
+
+name: RavakWP Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "RavakWP build id (sent automatically by the WordPress panel)"
+        required: true
+        type: string
+      trace:
+        description: "Trace note (optional)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ravakwp-build-${{ github.event.inputs.build_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Android APK/AAB (build ${{ github.event.inputs.build_id }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      RVK_SITE_URL: ${{ secrets.RVK_SITE_URL }}
+      RVK_STORE_KEY: ${{ secrets.RVK_STORE_KEY }}
+      RVK_HMAC_KEY: ${{ secrets.RVK_HMAC_KEY }}
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      GRADLE_USER_HOME: /tmp/ravakwp/gradle-home
+
+    steps:
+      - name: Show build info
+        run: |
+          echo "RavakWP build_id = ${{ github.event.inputs.build_id }}"
+          echo "trace            = ${{ github.event.inputs.trace }}"
+          echo "runner           = $GITHUB_RUN_ID"
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - name: Ensure Android SDK packages (platform 34 / build-tools 34)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+      - name: Download runner bundle from WordPress (HMAC-signed)
+        env:
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+        run: |
+          mkdir -p /tmp/rvk-gh-runner
+          python3 - <<'PY'
+          import hashlib, hmac, os, time, urllib.request, zipfile, io
+
+          site  = os.environ["RVK_SITE_URL"].rstrip("/")
+          store = os.environ["RVK_STORE_KEY"]
+          key   = os.environ["RVK_HMAC_KEY"]
+          ts    = str(int(time.time()))
+          sig   = hmac.new(key.encode(), f"{ts}.".encode(), hashlib.sha256).hexdigest()
+
+          url   = f"{site}/wp-json/ravakwp/v1/gh/bundle"
+          req   = urllib.request.Request(url, method="GET", headers={
+              "X-RVK-Worker": store,
+              "X-RVK-Timestamp": ts,
+              "X-RVK-Signature": sig,
+          })
+          with urllib.request.urlopen(req, timeout=60) as r:
+              status = r.status
+              data = r.read()
+          if status != 200 or not data.startswith(b"PK"):
+              raise SystemExit(f"bundle download failed: HTTP {status}")
+
+          zipfile.ZipFile(io.BytesIO(data)).extractall("/tmp/rvk-gh-runner")
+          print("bundle extracted:", len(data), "bytes")
+          PY
+
+      - name: Run build (claim → compile → sign → deliver)
+        env:
+          BUILD_ID: ${{ github.event.inputs.build_id }}
+        run: |
+          python3 /tmp/rvk-gh-runner/ravakwp-gh-runner/runner.py \
+            --build-id "$BUILD_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Result
+        if: always()
+        run: |
+          echo "RavakWP build ${{ github.event.inputs.build_id }} finished."
+          echo "APK/AAB (if the build completed) are downloadable from the WordPress panel:"
+          echo "WordPress → RavakWP App Builder → Build"
